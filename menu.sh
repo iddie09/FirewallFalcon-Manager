@@ -1346,21 +1346,7 @@ list_users() {
         local connection_string="$online_count / $limit"
         local plain_status="Active"
         local status="${C_GREEN}🟢 Active${C_RESET}"
-
-        if [[ -z "${system_user_lookup[$user]+x}" ]]; then
-            plain_status="Not Found"
-            status="${C_RED}Not Found${C_RESET}"
-        elif [[ -n "${locked_user_lookup[$user]+x}" ]]; then
-            plain_status="Locked"
-            status="${C_YELLOW}🔒 Locked${C_RESET}"
-        elif [[ -n "$expiry" && "$expiry" != "Never" ]]; then
-            local expiry_ts
-            expiry_ts=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
-            if [[ "$expiry_ts" =~ ^[0-9]+$ ]] && (( expiry_ts > 0 && expiry_ts < current_ts )); then
-                plain_status="Expired"
-                status="${C_RED}🗓️ Expired${C_RESET}"
-            fi
-        fi
+        local quota_exceeded=false
 
         [[ -z "$bandwidth_gb" ]] && bandwidth_gb="0"
         local bw_string="Unlimited"
@@ -1373,6 +1359,36 @@ list_users() {
             local used_gb
             used_gb=$(awk "BEGIN {printf \"%.1f\", $used_bytes / 1073741824}")
             bw_string="${used_gb}/${bandwidth_gb}GB"
+            local quota_bytes
+            quota_bytes=$(awk "BEGIN {printf \"%.0f\", $bandwidth_gb * 1073741824}")
+            if [[ "$quota_bytes" =~ ^[0-9]+$ ]] && (( used_bytes >= quota_bytes )); then
+                quota_exceeded=true
+            fi
+        fi
+
+        if [[ -z "${system_user_lookup[$user]+x}" ]]; then
+            plain_status="Not Found"
+            status="${C_RED}Not Found${C_RESET}"
+        elif [[ -n "$expiry" && "$expiry" != "Never" ]]; then
+            local expiry_ts
+            expiry_ts=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
+            if [[ "$expiry_ts" =~ ^[0-9]+$ ]] && (( expiry_ts > 0 && expiry_ts < current_ts )); then
+                plain_status="Expired"
+                status="${C_RED}🗓️ Expired${C_RESET}"
+            fi
+        fi
+
+        if [[ "$plain_status" == "Active" && "$quota_exceeded" == true ]]; then
+            if [[ -n "${locked_user_lookup[$user]+x}" ]]; then
+                plain_status="BW Locked"
+                status="${C_RED}🔒 BW Locked${C_RESET}"
+            else
+                plain_status="Quota Exceeded"
+                status="${C_RED}📦 Quota Exceeded${C_RESET}"
+            fi
+        elif [[ "$plain_status" == "Active" && -n "${locked_user_lookup[$user]+x}" ]]; then
+            plain_status="Locked"
+            status="${C_YELLOW}🔒 Locked${C_RESET}"
         fi
 
         local line_color="$C_WHITE"
@@ -1380,6 +1396,8 @@ list_users() {
             "Active") line_color="$C_GREEN" ;;
             "Locked") line_color="$C_YELLOW" ;;
             "Expired") line_color="$C_RED" ;;
+            "BW Locked") line_color="$C_RED" ;;
+            "Quota Exceeded") line_color="$C_RED" ;;
             "Not Found") line_color="$C_DIM" ;;
         esac
 
@@ -4278,11 +4296,11 @@ main_menu() {
         
         echo
         echo -e "   ${C_TITLE}═══════════════════[ ${C_BOLD}👤 USER MANAGEMENT ${C_RESET}${C_TITLE}]═══════════════════${C_RESET}"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "1" "✨ Create New User" "6" "✏️  Edit User Details"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "2" "🗑️  Delete User" "7" "📋 List Managed Users"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "3" "🔄 Renew User Account" "8" "📱 Generate Client Config"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "4" "🔒 Lock User Account" "9" "⏱️  Create Trial Account"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "5" "🔓 Unlock User Account" "10" "📊 View User Bandwidth"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "1" "✨ Create New User" "2" "🗑️  Delete User"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "3" "🔄 Renew User Account" "4" "🔒 Lock User Account"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "5" "🔓 Unlock User Account" "6" "✏️  Edit User Details"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "7" "📋 List Managed Users" "8" "📱 Generate Client Config"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "9" "⏱️  Create Trial Account" "10" "📊 View User Bandwidth"
         printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "11" "👥 Bulk Create Users"
         
         echo
@@ -4292,9 +4310,9 @@ main_menu() {
 
         echo
         echo -e "   ${C_TITLE}══════════════[ ${C_BOLD}⚙️ SYSTEM SETTINGS ${C_RESET}${C_TITLE}]═══════════════${C_RESET}"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "15" "☁️  CloudFlare Free Domain" "18" "💾 Backup User Data"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "16" "🎨 SSH Banner Config" "19" "📥 Restore User Data"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "17" "🔄 Auto-Reboot Task" "20" "🧹 Cleanup Expired Users"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "15" "☁️  CloudFlare Free Domain" "16" "🎨 SSH Banner Config"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "17" "🔄 Auto-Reboot Task" "18" "💾 Backup User Data"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "19" "📥 Restore User Data" "20" "🧹 Cleanup Expired Users"
 
         echo
         echo -e "   ${C_DANGER}═══════════════════[ ${C_BOLD}🔥 DANGER ZONE ${C_RESET}${C_DANGER}]═══════════════════${C_RESET}"
