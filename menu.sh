@@ -51,6 +51,8 @@ DNSTT_CONFIG_FILE="$DB_DIR/dnstt_info.conf"
 DNS_INFO_FILE="$DB_DIR/dns_info.conf"
 UDP_CUSTOM_DIR="/root/udp"
 UDP_CUSTOM_SERVICE_FILE="/etc/systemd/system/udp-custom.service"
+UDPGW_BINARY="/usr/local/bin/udpgw"
+UDPGW_SERVICE_FILE="/etc/systemd/system/udpgw.service"
 SSH_BANNER_FILE="/etc/bannerssh"
 FALCONPROXY_SERVICE_FILE="/etc/systemd/system/falconproxy.service"
 FALCONPROXY_BINARY="/usr/local/bin/falconproxy"
@@ -450,6 +452,52 @@ check_and_open_firewall_port() {
     return 0
 }
 
+check_and_open_firewall_port_range() {
+    local port_range="$1"
+    local protocol="${2:-tcp}"
+    local firewall_detected=false
+
+    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+        firewall_detected=true
+        if ! ufw status | grep -Fq "$port_range/$protocol"; then
+            echo -e "${C_YELLOW}🔥 UFW firewall is active and range ${port_range}/${protocol} is closed.${C_RESET}"
+            read -p "👉 Do you want to open this port range now? (y/n): " confirm
+            if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                ufw allow "$port_range/$protocol"
+                echo -e "${C_GREEN}✅ Range ${port_range}/${protocol} has been opened in UFW.${C_RESET}"
+            else
+                echo -e "${C_RED}❌ Warning: Range ${port_range}/${protocol} was not opened. The service may not work correctly.${C_RESET}"
+                return 1
+            fi
+        else
+            echo -e "${C_GREEN}✅ Range ${port_range}/${protocol} is already open in UFW.${C_RESET}"
+        fi
+    fi
+
+    if command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld; then
+        firewall_detected=true
+        if ! firewall-cmd --quiet --query-port="$port_range/$protocol"; then
+            echo -e "${C_YELLOW}🔥 firewalld is active and range ${port_range}/${protocol} is not open.${C_RESET}"
+            read -p "👉 Do you want to open this port range now? (y/n): " confirm
+            if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                firewall-cmd --add-port="$port_range/$protocol" --permanent
+                firewall-cmd --reload
+                echo -e "${C_GREEN}✅ Range ${port_range}/${protocol} has been opened in firewalld.${C_RESET}"
+            else
+                echo -e "${C_RED}❌ Warning: Range ${port_range}/${protocol} was not opened. The service may not work correctly.${C_RESET}"
+                return 1
+            fi
+        else
+            echo -e "${C_GREEN}✅ Range ${port_range}/${protocol} is already open in firewalld.${C_RESET}"
+        fi
+    fi
+
+    if ! $firewall_detected; then
+        echo -e "${C_BLUE}ℹ️ No active firewall (UFW or firewalld) detected. Assuming range ${port_range}/${protocol} is open.${C_RESET}"
+    fi
+    return 0
+}
+
 check_and_free_ports() {
     local ports_to_check=("$@")
     for port in "${ports_to_check[@]}"; do
@@ -498,7 +546,7 @@ setup_limiter_service() {
     # Combined limiter + bandwidth monitoring
     cat > "$LIMITER_SCRIPT" << 'EOF'
 #!/bin/bash
-# FirewallFalcon limiter version 2026-04-05.1
+# FirewallFalcon limiter version 2026-04-17.2
 DB_FILE="/etc/firewallfalcon/users.db"
 BW_DIR="/etc/firewallfalcon/bandwidth"
 PID_DIR="$BW_DIR/pidtrack"
@@ -587,7 +635,13 @@ while true; do
         [[ -z "$user" || "$user" == \#* ]] && continue
 
         declare -A unique_pids=()
-        for pid in ${session_pids["$user"]} ${loginuid_pids["$user"]}; do
+        pid_candidates=""
+        if [[ -n "${session_pids[$user]}" ]]; then
+            pid_candidates="${session_pids[$user]}"
+        else
+            pid_candidates="${loginuid_pids[$user]}"
+        fi
+        for pid in $pid_candidates; do
             [[ "$pid" =~ ^[0-9]+$ ]] && unique_pids["$pid"]=1
         done
 
@@ -765,8 +819,9 @@ EOF
 }
 
 sync_runtime_components_if_needed() {
-    local limiter_marker="# FirewallFalcon limiter version 2026-04-05.1"
+    local limiter_marker="# FirewallFalcon limiter version 2026-04-17.2"
     cleanup_legacy_bandwidth_runtime
+    setup_trial_cleanup_script >/dev/null 2>&1
     if [[ ! -f "$LIMITER_SCRIPT" ]] || ! grep -Fqx "$limiter_marker" "$LIMITER_SCRIPT" 2>/dev/null; then
         setup_limiter_service >/dev/null 2>&1
     fi
@@ -815,6 +870,14 @@ BW_DIR="/etc/firewallfalcon/bandwidth"
 
 username="$1"
 if [[ -z "$username" ]]; then exit 1; fi
+
+db_line=$(grep "^${username}:" "$DB_FILE" 2>/dev/null | head -n 1)
+if [[ -z "$db_line" ]]; then exit 0; fi
+
+IFS=: read -r _ _ _ _ _ trial_marker _rest <<< "$db_line"
+if [[ "$trial_marker" != "trial" ]]; then
+    exit 0
+fi
 
 # Kill active sessions
 killall -u "$username" -9 &>/dev/null
@@ -1306,7 +1369,7 @@ create_user() {
     fi
     usermod -aG "$FF_USERS_GROUP" "$username" 2>/dev/null
     echo "$username:$password" | chpasswd; chage -E "$expire_date" "$username"
-    echo "$username:$password:$expire_date:$limit:$bandwidth_gb" >> "$DB_FILE"
+    echo "$username:$password:$expire_date:$limit:$bandwidth_gb:trial" >> "$DB_FILE"
     
     local bw_display="Unlimited"
     if [[ "$bandwidth_gb" != "0" ]]; then bw_display="${bandwidth_gb} GB"; fi
@@ -1868,10 +1931,13 @@ ssh_banner_menu() {
 install_udp_custom() {
     clear; show_banner
     echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Installing udp-custom ---${C_RESET}"
-    if [ -f "$UDP_CUSTOM_SERVICE_FILE" ]; then
+    if [ -f "$UDP_CUSTOM_SERVICE_FILE" ] || [ -f "$UDPGW_SERVICE_FILE" ]; then
         echo -e "\n${C_YELLOW}ℹ️ udp-custom is already installed.${C_RESET}"
         return
     fi
+
+    check_and_free_ports 36712 7800 || return
+    check_and_open_firewall_port 36712 udp || return
 
     echo -e "\n${C_GREEN}⚙️ Creating directory for udp-custom...${C_RESET}"
     rm -rf "$UDP_CUSTOM_DIR"
@@ -1902,6 +1968,16 @@ install_udp_custom() {
     fi
     chmod +x "$UDP_CUSTOM_DIR/udp-custom"
 
+    echo -e "\n${C_GREEN}📦 Downloading udpgw helper...${C_RESET}"
+    wget -q --show-progress -O "$UDPGW_BINARY" "https://raw.githubusercontent.com/http-custom/udp-custom/main/module/udpgw"
+    if [ $? -ne 0 ]; then
+        echo -e "\n${C_RED}❌ Failed to download the udpgw helper binary.${C_RESET}"
+        rm -rf "$UDP_CUSTOM_DIR"
+        rm -f "$UDPGW_BINARY"
+        return
+    fi
+    chmod +x "$UDPGW_BINARY"
+
     echo -e "\n${C_GREEN}📝 Creating default config.json...${C_RESET}"
     cat > "$UDP_CUSTOM_DIR/config.json" <<EOF
 {
@@ -1915,6 +1991,23 @@ install_udp_custom() {
 EOF
     chmod 644 "$UDP_CUSTOM_DIR/config.json"
 
+    echo -e "\n${C_GREEN}📝 Creating udpgw systemd service file...${C_RESET}"
+    cat > "$UDPGW_SERVICE_FILE" <<EOF
+[Unit]
+Description=FirewallFalcon UDPGW Backend
+After=network.target
+
+[Service]
+User=root
+Type=simple
+ExecStart=$UDPGW_BINARY --listen-addr 127.0.0.1:7800 --max-clients 1000 --max-connections-for-client 100
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
     echo -e "\n${C_GREEN}📝 Creating systemd service file...${C_RESET}"
     cat > "$UDP_CUSTOM_SERVICE_FILE" <<EOF
 [Unit]
@@ -1924,43 +2017,51 @@ After=network.target
 [Service]
 User=root
 Type=simple
-ExecStart=$UDP_CUSTOM_DIR/udp-custom server -exclude 53,5300
+ExecStart=$UDP_CUSTOM_DIR/udp-custom server
 WorkingDirectory=$UDP_CUSTOM_DIR/
 Restart=always
 RestartSec=2s
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
 
     echo -e "\n${C_GREEN}▶️ Enabling and starting udp-custom service...${C_RESET}"
     systemctl daemon-reload
+    systemctl enable udpgw.service
+    systemctl start udpgw.service
     systemctl enable udp-custom.service
     systemctl start udp-custom.service
     sleep 2
-    if systemctl is-active --quiet udp-custom; then
+    if systemctl is-active --quiet udpgw && systemctl is-active --quiet udp-custom; then
         echo -e "\n${C_GREEN}✅ SUCCESS: udp-custom is installed and active.${C_RESET}"
     else
         echo -e "\n${C_RED}❌ ERROR: udp-custom service failed to start.${C_RESET}"
-        echo -e "${C_YELLOW}ℹ️ Displaying last 15 lines of the service log for diagnostics:${C_RESET}"
+        echo -e "${C_YELLOW}ℹ️ Displaying last 15 lines of the udp-custom and udpgw logs for diagnostics:${C_RESET}"
         journalctl -u udp-custom.service -n 15 --no-pager
+        journalctl -u udpgw.service -n 15 --no-pager
     fi
 }
 
 uninstall_udp_custom() {
     echo -e "\n${C_BOLD}${C_PURPLE}--- 🗑️ Uninstalling udp-custom ---${C_RESET}"
-    if [ ! -f "$UDP_CUSTOM_SERVICE_FILE" ]; then
+    if [ ! -f "$UDP_CUSTOM_SERVICE_FILE" ] && [ ! -f "$UDPGW_SERVICE_FILE" ]; then
         echo -e "${C_YELLOW}ℹ️ udp-custom is not installed, skipping.${C_RESET}"
         return
     fi
+    echo -e "${C_GREEN}🛑 Stopping and disabling udpgw service...${C_RESET}"
+    systemctl stop udpgw.service >/dev/null 2>&1
+    systemctl disable udpgw.service >/dev/null 2>&1
     echo -e "${C_GREEN}🛑 Stopping and disabling udp-custom service...${C_RESET}"
     systemctl stop udp-custom.service >/dev/null 2>&1
     systemctl disable udp-custom.service >/dev/null 2>&1
     echo -e "${C_GREEN}🗑️ Removing systemd service file...${C_RESET}"
     rm -f "$UDP_CUSTOM_SERVICE_FILE"
+    rm -f "$UDPGW_SERVICE_FILE"
     systemctl daemon-reload
     echo -e "${C_GREEN}🗑️ Removing udp-custom directory and files...${C_RESET}"
     rm -rf "$UDP_CUSTOM_DIR"
+    rm -f "$UDPGW_BINARY"
     echo -e "${C_GREEN}✅ udp-custom has been uninstalled successfully.${C_RESET}"
 }
 
@@ -3123,6 +3224,10 @@ install_zivpn() {
         return
     fi
 
+    check_and_free_ports 5667 || return
+    check_and_open_firewall_port 5667 udp || return
+    check_and_open_firewall_port_range "6000:19999" udp || return
+
     echo -e "\n${C_GREEN}⚙️ Checking system architecture...${C_RESET}"
     local arch=$(uname -m)
     local zivpn_url=""
@@ -3236,15 +3341,11 @@ EOF
     local iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
     
     if [ -n "$iface" ]; then
-        iptables -t nat -A PREROUTING -i "$iface" -p udp --dport 6000:19999 -j DNAT --to-destination :5667
+        iptables -t nat -C PREROUTING -i "$iface" -p udp --dport 6000:19999 -j DNAT --to-destination :5667 2>/dev/null || \
+            iptables -t nat -A PREROUTING -i "$iface" -p udp --dport 6000:19999 -j DNAT --to-destination :5667
         # Note: IPTables rules are not persistent by default without iptables-persistent package
     else
         echo -e "${C_YELLOW}⚠️ Could not detect default interface for IPTables redirection.${C_RESET}"
-    fi
-
-    if command -v ufw &>/dev/null; then
-        ufw allow 6000:19999/udp >/dev/null
-        ufw allow 5667/udp >/dev/null
     fi
 
     # Cleanup
@@ -3274,6 +3375,12 @@ uninstall_zivpn() {
     echo -e "\n${C_BLUE}🛑 Stopping services...${C_RESET}"
     systemctl stop zivpn.service 2>/dev/null
     systemctl disable zivpn.service 2>/dev/null
+
+    local iface
+    iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+    if [ -n "$iface" ]; then
+        iptables -t nat -D PREROUTING -i "$iface" -p udp --dport 6000:19999 -j DNAT --to-destination :5667 2>/dev/null || true
+    fi
     
     echo -e "${C_BLUE}🗑️ Removing files...${C_RESET}"
     rm -f "$ZIVPN_SERVICE_FILE"
@@ -3599,7 +3706,8 @@ refresh_ssh_session_cache() {
 
     local -A managed_user_lookup=()
     local -A uid_user_lookup=()
-    local -A seen_sessions=()
+    local -A session_pids=()
+    local -A loginuid_pids=()
     local managed_user system_user system_uid ssh_pid ssh_owner candidate_user login_uid
 
     while IFS=: read -r managed_user _rest; do
@@ -3613,25 +3721,41 @@ refresh_ssh_session_cache() {
     while read -r ssh_pid ssh_owner; do
         [[ "$ssh_pid" =~ ^[0-9]+$ ]] || continue
 
-        candidate_user=""
         if [[ -n "$ssh_owner" && "$ssh_owner" != "root" && "$ssh_owner" != "sshd" && -n "${managed_user_lookup[$ssh_owner]+x}" ]]; then
-            candidate_user="$ssh_owner"
+            session_pids["$ssh_owner"]+="$ssh_pid "
         elif [[ -r "/proc/$ssh_pid/loginuid" ]]; then
             login_uid=""
             read -r login_uid < "/proc/$ssh_pid/loginuid" || login_uid=""
             if [[ "$login_uid" =~ ^[0-9]+$ && "$login_uid" != "4294967295" ]]; then
                 candidate_user="${uid_user_lookup[$login_uid]}"
+                if [[ -n "$candidate_user" && -n "${managed_user_lookup[$candidate_user]+x}" ]]; then
+                    loginuid_pids["$candidate_user"]+="$ssh_pid "
+                fi
             fi
         fi
-
-        [[ -n "$candidate_user" && -n "${managed_user_lookup[$candidate_user]+x}" ]] || continue
-        [[ -z "${seen_sessions[$candidate_user:$ssh_pid]+x}" ]] || continue
-
-        seen_sessions["$candidate_user:$ssh_pid"]=1
-        ((SSH_SESSION_COUNTS["$candidate_user"]++))
-        SSH_SESSION_PIDS["$candidate_user"]+="$ssh_pid "
-        ((SSH_SESSION_TOTAL++))
     done < <(ps -C sshd -o pid=,user= 2>/dev/null)
+
+    local user pid pid_candidates
+    for user in "${!managed_user_lookup[@]}"; do
+        declare -A unique_pids=()
+        if [[ -n "${session_pids[$user]}" ]]; then
+            pid_candidates="${session_pids[$user]}"
+        else
+            pid_candidates="${loginuid_pids[$user]}"
+        fi
+
+        for pid in $pid_candidates; do
+            [[ "$pid" =~ ^[0-9]+$ ]] && unique_pids["$pid"]=1
+        done
+
+        SSH_SESSION_COUNTS["$user"]=${#unique_pids[@]}
+        if (( ${#unique_pids[@]} > 0 )); then
+            for pid in "${!unique_pids[@]}"; do
+                SSH_SESSION_PIDS["$user"]+="$pid "
+            done
+            SSH_SESSION_TOTAL=$((SSH_SESSION_TOTAL + ${#unique_pids[@]}))
+        fi
+    done
 
     SSH_SESSION_CACHE_TS=$now
 }
